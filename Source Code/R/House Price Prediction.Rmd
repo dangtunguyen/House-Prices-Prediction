@@ -1,0 +1,202 @@
+Note: We have used a lot of codes from https://www.kaggle.com/jiashenliu/house-prices-advanced-regression-techniques/updated-xgboost-with-parameter-tuning/run/362252 and https://www.kaggle.com/jimthompson/house-prices-advanced-regression-techniques/boruta-feature-importance-analysis to do my project
+
+```{r,message=FALSE, warning=FALSE}
+# Load Packages
+library(MASS) 
+library(Metrics)
+library(corrplot)
+library(randomForest)
+library(lars)
+library(ggplot2)
+library(xgboost)
+library(Matrix)
+library(methods)
+```
+```{r load}
+# Read Data
+Training <- read.csv("../input/train.csv")
+Test <- read.csv("../input/test.csv")
+```
+
+The whole process is composed of four steps:
+
+* Feature Selection
+* Data Cleaning
+* Model Selection
+* Final Prediction
+
+
+### Feature Selection
+
+I used result of an [earlier Boruta](https://www.kaggle.com/jimthompson/house-prices-advanced-regression-techniques/boruta-feature-importance-analysis) feature importance analysis.
+
+```{r}
+CONFIRMED_ATTR <- c("MSSubClass","MSZoning","LotArea","LotShape","LandContour","Neighborhood",
+                    "BldgType","HouseStyle","OverallQual","OverallCond","YearBuilt",
+                    "YearRemodAdd","Exterior1st","Exterior2nd","MasVnrArea","ExterQual",
+                    "Foundation","BsmtQual","BsmtCond","BsmtFinType1","BsmtFinSF1",
+                    "BsmtFinType2","BsmtUnfSF","TotalBsmtSF","HeatingQC","CentralAir",
+                    "X1stFlrSF","X2ndFlrSF","GrLivArea","BsmtFullBath","FullBath","HalfBath",
+                    "BedroomAbvGr","KitchenAbvGr","KitchenQual","TotRmsAbvGrd","Functional",
+                    "Fireplaces","FireplaceQu","GarageType","GarageYrBlt","GarageFinish",
+                    "GarageCars","GarageArea","GarageQual","GarageCond","PavedDrive","WoodDeckSF",
+                    "OpenPorchSF","Fence")
+
+TENTATIVE_ATTR <- c("Alley","LandSlope","Condition1","RoofStyle","MasVnrType","BsmtExposure",
+                    "Electrical","EnclosedPorch","SaleCondition")
+
+REJECTED_ATTR <- c("LotFrontage","Street","Utilities","LotConfig","Condition2","RoofMatl",
+                   "ExterCond","BsmtFinSF2","Heating","LowQualFinSF","BsmtHalfBath",
+                   "X3SsnPorch","ScreenPorch","PoolArea","PoolQC","MiscFeature","MiscVal",
+                   "MoSold","YrSold","SaleType")
+
+TRAINING_PREDICTOR_ATTR <- c(CONFIRMED_ATTR, TENTATIVE_ATTR, "SalePrice")
+TEST_PREDICTOR_ATTR <- c(CONFIRMED_ATTR, TENTATIVE_ATTR)
+
+# Get selected attributes only
+Training <- Training[TRAINING_PREDICTOR_ATTR]
+n <- ncol(Training) #60
+```
+
+### Data Cleaning
+
+```{r,message=FALSE, warning=FALSE}
+# Transfer dummny variables into numeric form
+for(i in 1:n){
+  if(is.factor(Training[,i])){
+    Training[,i]<-as.integer(Training[,i])
+  }
+}
+
+# Replace missing variables with 0
+Training[is.na(Training)]<-0
+```
+
+#### Model 1: Lasso Regression
+```{r,message=FALSE,warning=FALSE}
+Independent_variable<- as.matrix(Training_Inner[,1:n-1])
+Dependent_Variable<- as.matrix(Training_Inner[,n])
+laa<- lars(Independent_variable,Dependent_Variable,type = 'lasso')
+best_step<- laa$df[which.min(laa$Cp)]
+lasso_prediction<- predict.lars(laa,newx =as.matrix(Test_Inner[,1:n-1]), s=best_step, type= "fit")
+#write.csv(lasso_prediction, file = "lasso_prediction.csv")
+rmse(log(Test_Inner$SalePrice),log(lasso_prediction$fit))
+```
+
+### Model 2: Random Forest
+
+```{r,message=FALSE, warning=FALSE}
+forest <- randomForest(SalePrice~.,data= Training_Inner)
+forest_prediction <- predict(forest, newdata= Test_Inner)
+#write.csv(forest_prediction, file = "forest_prediction.csv")
+rmse(log(Test_Inner$SalePrice),log(forest_prediction))
+```
+
+### Model 3: XGBoost 
+
+```{r,message=FALSE,warning=FALSE}
+# Transform the dataset into Sparse matrix
+train <- as.matrix(Training_Inner, rownames.force=NA)
+test <- as.matrix(Test_Inner, rownames.force=NA)
+train <- as(train, "sparseMatrix")
+test <- as(test, "sparseMatrix")
+# Exclude objective variable in 'data option'
+train_Data <- xgb.DMatrix(data = train[,1:n-1], label = train[,"SalePrice"])
+
+# Set parameters
+param <-list(
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  booster = "gbtree",
+  max_depth = 10,
+  eta = 0.03,
+  gamma = 0.1, 
+  subsample = 0.734,
+  colsample_bytree = 0.4
+)
+
+# Test the model before making actual prediction.
+initialTraining <-
+  xgb.train(params = param,
+            data = train_Data,
+            nrounds = 600,
+            verbose = FALSE,
+            nthread = 6)
+
+test_data <- xgb.DMatrix(data = test[,1:n-1])
+
+xgboost_prediction <- predict(initialTraining, test_data)
+#write.csv(xgboost_prediction, file = "xgboost_prediction.csv")
+rmse(log(Test_Inner$SalePrice),log(xgboost_prediction))
+```
+
+### Ensemble Prediction
+
+Based on the local run, we can see that Lasso has the worst performance and XGBoost has the best performance. To prevent overfitting, I will use a simple ensemble method by averaging (with some weight for each model) the prediction result of Random Forest and XGBoost (not Lasso since its performance is not good).
+
+```{r}
+ensemble_prediction <- 0.2*forest_prediction + 0.8*xgboost_prediction
+rmse(log(Test_Inner$SalePrice),log(ensemble_prediction))
+```
+
+
+### Final Prediction
+#### Feature slection and data cleaning
+
+Before prediction, the test set should be transformed into the same form of training set.
+```{r,message=FALSE, warning=FALSE}
+# Backup the ID field of Test dataset
+TestID <- Test["Id"]
+
+# Get selected attributes only
+Test <- Test[TEST_PREDICTOR_ATTR]
+nrow(Test)
+
+# Clean the test data
+for(i in 1:m){
+ if(is.factor(Test[,i])){
+   Test[,i]<-as.integer(Test[,i])
+ }
+}
+# Replace missing variables with 0
+Test[is.na(Test)]<-0
+```
+
+#### Random Forest prediction
+
+```{r,message=FALSE, warning=FALSE}
+Forest <- randomForest(SalePrice~., data= Training)
+ForestPrediction <- predict(Forest, newdata= Test)
+```
+
+#### XGBoost prediction
+
+```{r,message=FALSE,warning=FALSE}
+re_train<- as.matrix(Training,rownames.force=NA)
+re_train<- as(re_train,"sparseMatrix")
+retrain_Data<- xgb.DMatrix(data = re_train[,1:n-1],label=re_train[,"SalePrice"])
+bstSparse_retrain<- xgb.train(params=param,
+                             data=retrain_Data,
+                             nrounds = 600,
+                             verbose = FALSE,
+                             nthread = 6
+                             )
+
+Test_Matrix<-as.matrix(Test,rownames.force = FALSE)
+Test_Matrix<-as(Test_Matrix,"sparseMatrix")
+Test_Matrix<-xgb.DMatrix(data = Test_Matrix[,1:n-1])
+
+XGBoostPrediction <- predict(bstSparse_retrain, newdata=Test_Matrix)
+XGBoostSubmission <- cbind(Id= TestID, SalePrice= XGBoostPrediction)
+colnames(XGBoostSubmission) <- c("Id","SalePrice")
+write.csv(XGBoostSubmission, file = "xgboost_submission.csv", row.names=FALSE)
+```
+
+#### Ensemble prediction
+
+```{r,message=FALSE,warning=FALSE}
+EnsemblePrediction <- 0.2*ForestPrediction + 0.8*XGBoostPrediction
+EnsembleSubmission <- cbind(Id= TestID, SalePrice= EnsemblePrediction)
+colnames(EnsembleSubmission) <- c("Id","SalePrice")
+write.csv(EnsembleSubmission, file = "ensemble_submission.csv", row.names=FALSE)
+```
